@@ -1,48 +1,48 @@
 #!/bin/sh
 
-# Attendre que la base de données soit prête (avec timeout)
-echo "Waiting for database to be ready..."
-timeout=60
-elapsed=0
-while ! pg_isready -h ${DB_HOST:-db} -p ${DB_PORT:-5432} -U ${DB_USERNAME} 2>/dev/null; do
-  echo "Database is unavailable - sleeping"
-  sleep 1
-  elapsed=$((elapsed + 1))
-  if [ $elapsed -ge $timeout ]; then
-    echo "Database connection timeout reached. Continuing without database check..."
-    break
+# Basic runtime sanity checks for required DB envs
+echo "Starting docker-entrypoint.sh"
+MISSING=0
+for v in DB_HOST DB_PORT DB_DATABASE DB_USERNAME; do
+  eval val="\$$v"
+  if [ -z "$val" ]; then
+    echo "Required env $v is not set"
+    MISSING=1
   fi
 done
 
-echo "Database is up - executing migrations with --force"
-php artisan migrate --force
+if [ "$MISSING" -eq 1 ]; then
+  echo "One or more required DB env vars are missing. Aborting to avoid infinite wait." >&2
+  exit 1
+fi
 
-echo "Creating admin user after migrations"
-sleep 2
-php artisan db:seed --class=AdminSeeder --force || echo "Admin seeder failed, continuing..."
+# Generate APP_KEY if not provided via env
+if [ -z "$APP_KEY" ]; then
+  echo "APP_KEY not set — generating one"
+  php artisan key:generate --force || true
+fi
 
-echo "Installing/configuring Passport OAuth"
-php artisan passport:install --force || echo "Passport install failed, continuing..."
+echo "Waiting for database to be ready..."
+MAX_WAIT=120
+WAITED=0
+while ! pg_isready -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USERNAME" >/dev/null 2>&1; do
+  if [ "$WAITED" -ge "$MAX_WAIT" ]; then
+    echo "Timeout waiting for database after ${MAX_WAIT}s" >&2
+    exit 1
+  fi
+  echo "Database is unavailable - sleeping 1s (waited=${WAITED}s)"
+  sleep 1
+  WAITED=$((WAITED+1))
+done
 
-echo "Running database seeders"
-php artisan db:seed --force || echo "Seeding failed, continuing..."
+echo "Database is up - executing migrations"
+# Clear caches to avoid serving stale routes/config from image build
+php artisan route:clear || true
+php artisan config:clear || true
+php artisan cache:clear || true
 
-echo "Clearing Laravel caches"
-php artisan config:clear
-php artisan cache:clear
-php artisan route:clear
-php artisan view:clear
-
-echo "Testing database connection"
-php artisan tinker --execute="try { DB::connection()->getPdo(); echo 'Database connection OK'; } catch(Exception \$e) { echo 'Database connection FAILED: ' . \$e->getMessage(); exit(1); }"
-
-echo "Generating Swagger documentation"
-php artisan l5-swagger:generate || echo "Swagger generation failed, continuing..."
-
-echo "Caching configuration for production"
-php artisan config:cache
-php artisan route:cache
-php artisan view:cache
+# Run migrations (non-blocking failure allowed)
+php artisan migrate --force || true
 
 echo "Starting Laravel application..."
 exec "$@"
